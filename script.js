@@ -1086,15 +1086,19 @@ function showSourceSwapPrompt(node, clientX, clientY) {
     if (window.SourceSwap && typeof window.SourceSwap.open === 'function') {
       let usageContext = null;
       let cteBody = null;
+      let cteRange = null;
 
       if (node.isCte) {
         // CTE-target mode: there's no single alias/filter to scope to (a
         // CTE that consolidates several raw sources joins all of them) —
         // the CTE's own full body text IS the "old logic" ground truth,
         // already available via the same range this app uses for the
-        // jump-to-query/tooltip feature.
-        const range = cteRangesByEntity.get(node.id);
-        cteBody = range ? currentFormattedSql.slice(range.start, range.end) : null;
+        // jump-to-query/tooltip feature. The range itself (not just the
+        // text) goes along too, so source-swap.js can splice the AI's
+        // replacement back into currentFormattedSql at the exact same
+        // spot afterward — see its handleGenerateClick.
+        cteRange = cteRangesByEntity.get(node.id) || null;
+        cteBody = cteRange ? currentFormattedSql.slice(cteRange.start, cteRange.end) : null;
       } else {
         // usageContext may be null (e.g. AST re-shape edge case) —
         // source-swap.js must degrade gracefully (no pre-filled
@@ -1116,6 +1120,7 @@ function showSourceSwapPrompt(node, clientX, clientY) {
         isCte: node.isCte,
         usageContext,
         cteBody,
+        cteRange,
       });
     } else {
       console.warn('[SQL-Vis] source-swap.js not loaded — cannot open the source-swap page.');

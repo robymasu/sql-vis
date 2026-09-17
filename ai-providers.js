@@ -36,7 +36,11 @@ const AI_RESPONSE_SCHEMA = {
   properties: {
     rewrittenQuery: {
       type: 'string',
-      description: 'The full original query, rewritten so every reference to the old source is replaced by the new source — renamed columns, adjusted join keys, and any additional filters the new source needs. Must preserve the original query\'s formatting/indentation/line breaks exactly except where a token must change, and must never rename or remove any existing "AS <alias>" — see STRICT RULES in the prompt.',
+      description: 'TABLE-SWAP MODE ONLY (a single physical table is the target — see the prompt): the full original query, rewritten so every reference to the old source is replaced by the new source — renamed columns, adjusted join keys, and any additional filters the new source needs. Must preserve the original query\'s formatting/indentation/line breaks exactly except where a token must change, and must never rename or remove any existing "AS <alias>". CTE-TARGET MODE: leave this an empty string — you fill in newCteBody instead, and the full query gets reassembled deterministically outside of you, guaranteeing everything outside the target CTE stays byte-for-byte identical instead of relying on you to reproduce it unchanged.',
+    },
+    newCteBody: {
+      type: ['string', 'null'],
+      description: 'CTE-TARGET MODE ONLY: the ENTIRE replacement for the target CTE, in the exact same shape you were given it — starting with "<cteName> AS (" and ending with the matching closing ")". Do NOT include anything else from the query; everything outside this CTE is spliced back in verbatim by code, not by you, so it is guaranteed unchanged no matter what you put here. TABLE-SWAP MODE: null.',
     },
     columnMappings: {
       type: 'array',
@@ -83,7 +87,7 @@ const AI_RESPONSE_SCHEMA = {
       items: { type: 'string' },
     },
   },
-  required: ['rewrittenQuery', 'columnMappings', 'addedFilters', 'newFilterSql', 'newNumericColumns', 'warnings', 'finalOutputNumericColumns'],
+  required: ['rewrittenQuery', 'newCteBody', 'columnMappings', 'addedFilters', 'newFilterSql', 'newNumericColumns', 'warnings', 'finalOutputNumericColumns'],
 };
 
 /* ═════════════════════════════════════════════════════════════
@@ -161,6 +165,7 @@ YOUR TASK:
 3. Map the given numeric-column list (and only that list) to their new-source equivalents.
 4. Rewrite the given old-source filter into an equivalent standalone filter valid against "FROM ${targetTable.newName} AS src" alone.
 5. Separately, look at the ORIGINAL QUERY's own outermost/final SELECT list (not the raw source) and identify which output column ALIASES look like numeric, summable business metrics purely from naming convention (things like "quantity", "qty", "amount", "total", "count", "price", "value", "cost", "sum", "num", "hours", "days" in the name). List them in finalOutputNumericColumns. This is a separate concern from step 3 — it's about the query's own final output columns, which keep identical names on both the old and new version of the query (per the STRICT RULES), so this same list works for validating either one.
+6. Set newCteBody to null — that field is only used in CTE-consolidation mode, not this single-table swap.
 
 Respond using only the structured fields you're given — no prose outside them.`;
 }
@@ -212,16 +217,15 @@ NEW SOURCE TO ADD (via LEFT JOIN — this SUPPLEMENTS the CTE's existing source(
 COLUMNS TO MOVE TO THE NEW SOURCE (every other column in the CTE keeps its exact current source expression): ${columnsToAdjust.join(', ')}
 
 STRICT RULES FOR THE REWRITE (violating these makes the rewrite unusable, even if the SQL logic is otherwise correct):
-- Preserve the original query's formatting as closely as possible — same line breaks, same indentation, same statement structure, everywhere OUTSIDE the target CTE. Touch only what must change.
 - Do NOT remove or modify the CTE's existing FROM/JOIN for its current source(s) — they stay exactly as they are. ADD a new JOIN to ${newSourceName} alongside them.
 - Always use LEFT JOIN for the new source, never INNER JOIN — a row with no match in ${newSourceName} must still survive with NULLs for the adjusted columns, not get silently dropped from the result.
 - Infer the join key(s) between the CTE's existing source and ${newSourceName} from matching identifier columns you can see in the CTE body and the new sample's columns (e.g. a shared product/plant/material code). If you aren't confident in the join key, say so explicitly in warnings rather than silently guessing.
-- Re-point ONLY the listed columns (${columnsToAdjust.join(', ')}) to read from the new source's alias. Every other column in the CTE's SELECT list must keep its EXACT original source expression, untouched.
+- Re-point ONLY the listed columns (${columnsToAdjust.join(', ')}) to read from the new source's alias. Every other column in the CTE's SELECT list must keep its EXACT original source expression, untouched — same formatting, same indentation, same casing, same comma placement, nothing reflowed just because you're touching a nearby line.
 - The CTE's own output column list (its SELECT list aliases) must stay EXACTLY the same — every CTE/query downstream of "${cteName}" reads it by those names and must keep working unchanged.
 
 YOUR TASK:
 1. Compare the new source's sample data against the CTE's current body. Identify which new-source column corresponds to each of the listed columns-to-adjust, and which columns look like the right join key between the CTE's existing source and the new one.
-2. Produce a full rewrite of the ENTIRE ORIGINAL QUERY with the "${cteName}" CTE modified to add a LEFT JOIN to ${newSourceName} and re-point only the listed columns to it — following the STRICT RULES above exactly. Everything else in the query (other CTEs, the final SELECT, the CTE's other columns, etc.) must be byte-for-byte unchanged. The result must be valid, logically equivalent ${dialect} SQL.
+2. Produce ONLY the replacement for the "${cteName}" CTE — output it in the EXACT same shape you were given it above: starting with "${cteName} AS (" and ending with the matching closing ")". Add the LEFT JOIN to ${newSourceName} and re-point only the listed columns to it, following the STRICT RULES above exactly; every other line of the CTE stays byte-for-byte identical to what you were given. Put this in newCteBody. Leave rewrittenQuery as an empty string — you are NOT reproducing the rest of the query; it gets spliced back in separately, unchanged, by code that never touches you at all. The CTE body itself must be valid, logically equivalent ${dialect} SQL.
 3. Separately, look at the ORIGINAL QUERY's own outermost/final SELECT list (not any one CTE) and identify which output column ALIASES look like numeric, summable business metrics purely from naming convention (things like "quantity", "qty", "amount", "total", "count", "price", "value", "cost", "sum", "num", "hours", "days" in the name). List them in finalOutputNumericColumns.
 4. Set columnMappings to the old-column → new-source-column pairs for just the columns you moved, and addedFilters to any new filter conditions the new source needs (e.g. an expiry/active-flag check). Set newFilterSql to null and newNumericColumns to an empty array — those two are only meaningful for a single-physical-table swap, not this augmentation mode.
 
@@ -235,14 +239,13 @@ ${sharedHeader}
 REPLACEMENT SOURCE (the ONE new consolidated table to read from instead of whatever the CTE currently joins): ${newSourceName}
 
 STRICT RULES FOR THE REWRITE (violating these makes the rewrite unusable, even if the SQL logic is otherwise correct):
-- Preserve the original query's formatting as closely as possible — same line breaks, same indentation, same statement structure, everywhere OUTSIDE the target CTE. Touch only what must change.
 - The CTE's own output column list (its SELECT list aliases) must stay EXACTLY the same — every CTE/query downstream of "${cteName}" reads it by those names and must keep working unchanged. Only the CTE's internal FROM/JOIN/WHERE logic changes to read from ${newSourceName} instead.
 - If a column in the CTE's SELECT list has NO explicit alias and its source expression must change, add an explicit alias matching its ORIGINAL implicit name, for the same reason.
-- Rewrite the CTE's body to read ONLY from ${newSourceName} — every raw table it currently joins should disappear from the rewritten CTE (their columns/filters get re-derived from the new source's columns instead). If any of those raw tables are also used elsewhere in the query OUTSIDE this CTE, leave those other usages untouched.
+- Rewrite the CTE's body to read ONLY from ${newSourceName} — every raw table it currently joins should disappear from the rewritten CTE (their columns/filters get re-derived from the new source's columns instead). If any of those raw tables are also used elsewhere in the query OUTSIDE this CTE, that's not your concern — you never see or touch that part of the query at all (see below).
 
 YOUR TASK:
 1. Compare the CTE's current body against the new source's sample data. Identify which new-source column corresponds to each column the CTE currently reads (across all the raw tables it joins), including any additional filter condition the new source needs that wasn't needed before.
-2. Produce a full rewrite of the ENTIRE ORIGINAL QUERY with ONLY the "${cteName}" CTE's body replaced by a query against ${newSourceName} — following the STRICT RULES above exactly. Everything else in the query (other CTEs, the final SELECT, etc.) must be byte-for-byte unchanged. The result must be valid, logically equivalent ${dialect} SQL.
+2. Produce ONLY the replacement for the "${cteName}" CTE — output it in the EXACT same shape you were given it above: starting with "${cteName} AS (" and ending with the matching closing ")". Rewrite its body to read from ${newSourceName} instead, following the STRICT RULES above exactly. Put this in newCteBody. Leave rewrittenQuery as an empty string — you are NOT reproducing the rest of the query (other CTEs, the final SELECT, etc.); it gets spliced back in separately, unchanged, by code that never touches you at all. The CTE body itself must be valid, logically equivalent ${dialect} SQL.
 3. Separately, look at the ORIGINAL QUERY's own outermost/final SELECT list (not any one CTE) and identify which output column ALIASES look like numeric, summable business metrics purely from naming convention (things like "quantity", "qty", "amount", "total", "count", "price", "value", "cost", "sum", "num", "hours", "days" in the name). List them in finalOutputNumericColumns.
 4. Set columnMappings to the old-CTE-column → new-source-column pairs you used, and addedFilters to any new filter conditions you introduced. Set newFilterSql to null and newNumericColumns to an empty array — those two are only meaningful for a single-physical-table swap, not this CTE-consolidation mode.
 
@@ -263,8 +266,15 @@ function validateAiResponseShape(obj) {
   for (const field of AI_RESPONSE_SCHEMA.required) {
     if (!(field in obj)) throw new Error(`AI response is missing required field "${field}".`);
   }
-  if (typeof obj.rewrittenQuery !== 'string' || !obj.rewrittenQuery.trim()) {
-    throw new Error('AI response\'s "rewrittenQuery" was empty.');
+  // Exactly one of these carries the actual rewrite: rewrittenQuery in
+  // table-swap mode (the AI reproduces the whole query itself), newCteBody
+  // in CTE-target mode (source-swap.js splices it into the original text
+  // deterministically instead — see handleGenerateClick). Either is fine
+  // as long as at least one is a real, non-empty value.
+  const hasRewrittenQuery = typeof obj.rewrittenQuery === 'string' && obj.rewrittenQuery.trim();
+  const hasNewCteBody = typeof obj.newCteBody === 'string' && obj.newCteBody.trim();
+  if (!hasRewrittenQuery && !hasNewCteBody) {
+    throw new Error('AI response had neither a usable "rewrittenQuery" nor "newCteBody".');
   }
   if (!Array.isArray(obj.columnMappings) || !Array.isArray(obj.newNumericColumns) || !Array.isArray(obj.warnings)
     || !Array.isArray(obj.addedFilters) || !Array.isArray(obj.finalOutputNumericColumns)) {

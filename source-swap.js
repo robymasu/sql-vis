@@ -491,6 +491,26 @@ function renderResults(aiResult, comparisonQuery, playgroundTables) {
 }
 
 /**
+ * spliceCteReplacement
+ * Rebuilds the full rewritten query WITHOUT ever asking the AI to
+ * reproduce it: everything outside the target CTE's exact text range is a
+ * plain slice of the ORIGINAL query — never regenerated, never
+ * paraphrased — so indentation, comma placement, casing, and every
+ * existing column alias outside the CTE are guaranteed byte-for-byte
+ * identical. Only the CTE's own text (which the AI DID rewrite, on
+ * purpose) gets swapped in.
+ * @param {string} originalQuery
+ * @param {{start:number,end:number}} cteRange - see script.js's
+ *   computeCteRanges/findCteTextRange — offsets into originalQuery
+ * @param {string} newCteBody - the AI's replacement, same shape as what
+ *   was extracted at cteRange ("cteName AS (\n...\n)")
+ * @returns {string}
+ */
+function spliceCteReplacement(originalQuery, cteRange, newCteBody) {
+  return originalQuery.slice(0, cteRange.start) + newCteBody.trim() + originalQuery.slice(cteRange.end);
+}
+
+/**
  * handleGenerateClick
  * Validates inputs synchronously (provider/key/original-query presence)
  * before making any network call, then: AI rewrite → comparison query →
@@ -572,6 +592,21 @@ async function handleGenerateClick() {
       newSample: newSamplePayload,
       extractedContext: usageContext,
     });
+
+    // CTE mode: reconstruct rewrittenQuery deterministically from the
+    // ORIGINAL query + the AI's small newCteBody fragment, rather than
+    // trusting whatever (if anything) the AI put directly in
+    // rewrittenQuery — see spliceCteReplacement's own comment for why
+    // this is what actually GUARANTEES the rest of the query is untouched.
+    if (isCte && queryContext.cteRange && aiResult.newCteBody && aiResult.newCteBody.trim()) {
+      aiResult.rewrittenQuery = spliceCteReplacement(queryContext.formattedSql, queryContext.cteRange, aiResult.newCteBody);
+    } else if (isCte && !(aiResult.rewrittenQuery && aiResult.rewrittenQuery.trim())) {
+      // Defensive fallback — shouldn't happen (cteRange is computed
+      // alongside cteBody in script.js's own click handler), but if it
+      // ever does, fail loudly instead of silently handing back an empty
+      // or unspliced query.
+      throw new Error('The AI didn\'t return a usable CTE replacement, and the original CTE\'s text position wasn\'t available to splice one in. Try generating again.');
+    }
 
     // Playground-table mode: both test-table names given -> materialize
     // the ORIGINAL and REWRITTEN queries as two full tables and diff THEIR
