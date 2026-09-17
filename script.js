@@ -67,8 +67,12 @@ const themeSelect      = document.getElementById('theme-select');
    ───────────────────────────────────────────────────────────── */
 let activeDialect       = 'snowflake'; // concrete dialect used for format/parse — always kept in sync with detection
 let currentFormattedSql = '';          // used by the read-only view + jump-to-query scroll
+let currentOriginalSql  = '';          // the user's own text, pre-formatSQL() (only smart-quote/trailing-comma cleanup applied) —
+                                        // this, not currentFormattedSql, is the splice/AI base for source-swap, so a GitLab diff
+                                        // against what the user actually typed only shows the CTE that was really changed
 let currentAst          = null;        // last parseToAST() result — reused by the source-swap handoff instead of re-parsing
 let cteRangesByEntity   = new Map();   // sanitized entity name -> { start, end } in currentFormattedSql (for scroll target)
+let cteRangesByEntityRaw = new Map();  // sanitized entity name -> { start, end } in currentOriginalSql (for source-swap splicing)
 let cteSnippetByEntity  = new Map();   // sanitized entity name -> short preview text (hover tooltip)
 let graphNodes = [];                   // current diagram's node models (world coords)
 let graphEdges = [];                   // current diagram's edge models
@@ -1126,14 +1130,15 @@ function showSourceSwapPrompt(node, clientX, clientY) {
       if (node.isCte) {
         // CTE-target mode: there's no single alias/filter to scope to (a
         // CTE that consolidates several raw sources joins all of them) —
-        // the CTE's own full body text IS the "old logic" ground truth,
-        // already available via the same range this app uses for the
-        // jump-to-query/tooltip feature. The range itself (not just the
-        // text) goes along too, so source-swap.js can splice the AI's
-        // replacement back into currentFormattedSql at the exact same
-        // spot afterward — see its handleGenerateClick.
-        cteRange = cteRangesByEntity.get(node.id) || null;
-        cteBody = cteRange ? currentFormattedSql.slice(cteRange.start, cteRange.end) : null;
+        // the CTE's own full body text IS the "old logic" ground truth.
+        // Uses the RAW (pre-formatSQL) range/text, not the reformatted
+        // currentFormattedSql — the AI sees the CTE in the user's own
+        // style and is spliced back into currentOriginalSql at the exact
+        // same spot, so a GitLab diff against what the user actually
+        // typed only shows the CTE that was really changed. See
+        // source-swap.js's handleGenerateClick/spliceCteReplacement.
+        cteRange = cteRangesByEntityRaw.get(node.id) || null;
+        cteBody = cteRange ? currentOriginalSql.slice(cteRange.start, cteRange.end) : null;
       } else {
         // usageContext may be null (e.g. AST re-shape edge case) —
         // source-swap.js must degrade gracefully (no pre-filled
@@ -1150,7 +1155,7 @@ function showSourceSwapPrompt(node, clientX, clientY) {
       // dotted identifier (e.g. "INTEGRATION.CORPORATE.FACT_TABLE"), or the
       // CTE's own name as-is.
       window.SourceSwap.open(node.qualifiedName, {
-        formattedSql: currentFormattedSql,
+        formattedSql: currentOriginalSql,
         dialect: activeDialect,
         isCte: node.isCte,
         usageContext,
@@ -1794,6 +1799,7 @@ async function runPipeline() {
     return;
   }
   const { sql: rawSql, removedCount: trailingCommasRemoved } = normalizeTrailingCommas(pastedSql);
+  currentOriginalSql = rawSql;
 
   try {
     // ── Step 1: Detect dialect — always runs, even if the user manually
@@ -1830,6 +1836,14 @@ async function runPipeline() {
     cteRangesByEntity = ranges;
     cteSnippetByEntity = snippets;
 
+    // Same lookup, run again against the user's OWN (pre-formatSQL) text —
+    // findCteTextRange only needs "cteName AS (" + bracket-matching, so it
+    // works identically regardless of keyword case/indentation. This range
+    // is what source-swap.js actually splices into (see showSourceSwapPrompt
+    // below), so the AI/splice never has to touch the reformatted text.
+    const { ranges: rawRanges } = computeCteRanges(rawSql, cteRawNameByEntity);
+    cteRangesByEntityRaw = rawRanges;
+
     // ── Step 5+6: Build graph model + layout ──
     const { nodes, edges } = buildGraphModel(tables, relations, cteNames, ranges, snippets, physicalRawNameByEntity);
     computeLayout(nodes);
@@ -1864,6 +1878,8 @@ function clearAll() {
   sqlInput.value = '';
   syncQueryEditor();
   currentFormattedSql = '';
+  currentOriginalSql = '';
+  cteRangesByEntityRaw = new Map();
   renderFormattedView();
   diagramCanvasEl.innerHTML = '';
   diagramHint.hidden = false;
