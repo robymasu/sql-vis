@@ -1000,6 +1000,41 @@ function applyViewBox() {
   svgEl.setAttribute('viewBox', `${viewBoxState.x} ${viewBoxState.y} ${viewBoxState.w} ${viewBoxState.h}`);
 }
 
+/**
+ * resizeViewBoxToContainer
+ * Keeps the current pan/zoom visually stable whenever #diagram-container
+ * changes size (dragging #relations-resizer or #panel-resizer, or just
+ * resizing the window) — without this, viewBoxState stays a fixed
+ * world-space rectangle while the container's pixel size changes, and the
+ * SVG's default `xMidYMid meet` scaling rescales/re-centers that same
+ * rectangle into the new shape, which reads as the whole diagram
+ * "jumping" even though nothing about the actual content moved. Adjusting
+ * viewBoxState's w/h to match the container's new aspect ratio (while
+ * keeping the CENTER point fixed) keeps what's on screen looking stable
+ * across a resize instead of snapping to a different scale/position.
+ */
+function resizeViewBoxToContainer() {
+  if (!svgEl) return;
+  const rect = diagramContainer.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+
+  const newAspect = rect.width / rect.height;
+  const oldAspect = viewBoxState.w / viewBoxState.h;
+  if (!Number.isFinite(newAspect) || !Number.isFinite(oldAspect) || Math.abs(newAspect - oldAspect) < 0.001) return;
+
+  const centerX = viewBoxState.x + viewBoxState.w / 2;
+  const centerY = viewBoxState.y + viewBoxState.h / 2;
+
+  if (newAspect > oldAspect) {
+    viewBoxState.w = viewBoxState.h * newAspect;
+  } else {
+    viewBoxState.h = viewBoxState.w / newAspect;
+  }
+  viewBoxState.x = centerX - viewBoxState.w / 2;
+  viewBoxState.y = centerY - viewBoxState.h / 2;
+  applyViewBox();
+}
+
 function screenToSvgPoint(clientX, clientY) {
   const rect = svgEl.getBoundingClientRect();
   const scaleX = viewBoxState.w / rect.width;
@@ -2017,3 +2052,9 @@ setActiveDialectButton(activeDialect);
 switchView('query');
 initPanelSplitter();
 initRelationsSplitter();
+
+// Keeps the ERD's pan/zoom visually stable across container-size changes
+// from either splitter (or a plain window resize) — see
+// resizeViewBoxToContainer's own comment for why this is needed at all.
+// No-ops harmlessly before any diagram has been rendered (svgEl is null).
+new ResizeObserver(() => resizeViewBoxToContainer()).observe(diagramContainer);
