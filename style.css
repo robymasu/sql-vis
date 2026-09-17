@@ -825,6 +825,13 @@ body {
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
+  /* Without this, flex-wrap's default cross-axis behavior (align-content:
+     normal, which resolves to stretch) spreads the wrapped rows apart to
+     fill any extra height once the box is resized taller than its
+     content needs — packing them at the top instead, with the leftover
+     room left empty at the bottom, is what actually looks resized rather
+     than "stretched". */
+  align-content: flex-start;
   overflow-y: auto;
 }
 .relations-meta[hidden] { display: none; }
