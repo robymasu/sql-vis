@@ -1,0 +1,8 @@
+{
+  "name": "sql-vis",
+  "private": true,
+  "description": "Client-side SQL query formatter, ERD visualizer, and AI-assisted source-swap tool. Static site + one optional Vercel Serverless Function (api/rewrite.js) for shared-team AI access.",
+  "engines": {
+    "node": ">=18"
+  }
+}

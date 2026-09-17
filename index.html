@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQL-Vis — Instant ERD from SQL</title>
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- sql-formatter: normalises raw SQL into clean, readable code -->
+  <script src="https://cdn.jsdelivr.net/npm/sql-formatter@15.4.9/dist/sql-formatter.min.js"></script>
+
+  <!-- node-sql-parser: turns SQL into an AST so we can read FROM/JOIN/ON deterministically -->
+  <script src="https://cdn.jsdelivr.net/npm/node-sql-parser@5.3.8/umd/index.umd.js"></script>
+
+  <!-- jsPDF: only used for the "Export as PDF" option (diagram is drawn to canvas, then embedded) -->
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+
+  <!-- NOTE: the ERD itself is a hand-built, draggable/pannable/zoomable SVG canvas
+       (see script.js MODULE 6-8) — not mermaid.js. Mermaid's static output can't be
+       repositioned or animated the way this app needs, so the diagram is rendered
+       directly from the extracted graph model instead. -->
+</head>
+<body>
+
+  <header class="app-header">
+    <div class="header-brand">
+      <span class="brand-logo">◱</span>
+      <span class="brand-name">SQL<span class="brand-accent">Vis</span></span>
+    </div>
+    <p class="header-tagline">Paste a query. Get a draggable ERD. 100% client-side.</p>
+
+    <label class="theme-select-wrap">
+      <span class="theme-select-label">Theme</span>
+      <select id="theme-select" class="theme-select" aria-label="Color theme">
+        <option value="dark">Dark</option>
+        <option value="light">Light</option>
+        <option value="blue">Blue</option>
+        <option value="green">Green</option>
+        <option value="pink">Pink</option>
+      </select>
+    </label>
+  </header>
+
+  <main class="app-main">
+
+    <!-- ── LEFT PANEL: SQL Input / Formatted view ── -->
+    <section class="panel panel--input" aria-label="SQL Input">
+      <div class="panel-header">
+        <div class="view-tabs" role="tablist" aria-label="Editor view">
+          <button class="view-tab active" data-view="query" role="tab" aria-selected="true">SQL Query</button>
+          <button class="view-tab" data-view="formatted" role="tab" aria-selected="false">Formatted SQL</button>
+        </div>
+        <div class="dialect-toggle" role="group" aria-label="SQL dialect (auto-detected)">
+          <button class="dialect-btn" data-dialect="snowflake">Snowflake</button>
+          <button class="dialect-btn" data-dialect="postgresql">PostgreSQL</button>
+          <button class="dialect-btn" data-dialect="mysql">MySQL</button>
+          <button class="dialect-btn" data-dialect="sqlite">SQLite</button>
+        </div>
+      </div>
+
+      <!-- "Paper" metaphor: SQL Query is the front page, Formatted SQL is the
+           back page. Both stay mounted; switching just crossfades/slides
+           between them (see MODULE 9) instead of hard show/hide. -->
+      <div class="paper-stack">
+        <!-- QUERY VIEW (front page): editable. A transparent textarea sits on
+             top of a highlighted <pre>; only the textarea scrolls, and its
+             scrollbar is invisible until hovered — the pre + line numbers
+             stay synced to its scroll position in JS. Long lines wrap to the
+             next visual row instead of scrolling sideways. -->
+        <div id="view-query" class="editor-view" data-view="query">
+          <div class="editor-wrap">
+            <div id="line-numbers" class="line-numbers" aria-hidden="true">1</div>
+            <div class="editor-scroll">
+              <pre id="sql-highlight" class="sql-highlight" aria-hidden="true"><code></code></pre>
+              <textarea
+                id="sql-input"
+                class="sql-textarea"
+                spellcheck="false"
+                placeholder="-- Paste a SELECT query with JOINs, e.g.:&#10;SELECT o.id, c.name, p.sku&#10;FROM orders o&#10;JOIN customers c ON o.customer_id = c.id&#10;LEFT JOIN order_items oi ON oi.order_id = o.id&#10;JOIN products p ON p.id = oi.product_id;"
+                aria-label="SQL query input"
+              ></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- FORMATTED VIEW (back page): read-only. Same look, but a plain
+             highlighted <pre> — no textarea, nothing to edit. -->
+        <div id="view-formatted" class="editor-view" data-view="formatted" hidden>
+          <div class="editor-wrap">
+            <div id="formatted-line-numbers" class="line-numbers" aria-hidden="true">1</div>
+            <div id="formatted-scroll" class="editor-scroll editor-scroll--readonly">
+              <pre id="formatted-highlight" class="sql-highlight sql-highlight--readonly"><code></code></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel-actions">
+        <button id="btn-visualize" class="btn btn--primary">
+          Format &amp; Visualize
+        </button>
+        <button id="btn-clear" class="btn btn--ghost">Clear</button>
+        <span id="detected-dialect" class="detected-dialect" hidden></span>
+      </div>
+    </section>
+
+    <div id="panel-resizer" class="panel-resizer" role="separator" aria-orientation="vertical"
+         aria-label="Resize SQL and ERD panels" tabindex="0"></div>
+
+    <!-- ── RIGHT PANEL: ERD Diagram — full-bleed, draggable/pannable canvas ── -->
+    <section class="panel panel--output" aria-label="ERD Diagram">
+      <div class="panel-header">
+        <span class="panel-label">ERD — Table Relationships</span>
+        <div class="export-group">
+          <select id="export-format" class="export-select" aria-label="Export format">
+            <option value="svg">SVG</option>
+            <option value="png">PNG</option>
+            <option value="jpg">JPG</option>
+            <option value="pdf">PDF</option>
+          </select>
+          <button id="btn-download" class="btn btn--ghost btn--sm" disabled>Download</button>
+        </div>
+      </div>
+
+      <!-- Always full-size — no separate "empty state" chrome eating space.
+           The legend is a small floating overlay INSIDE the canvas (like a
+           map legend), not a bar pushing the canvas down. -->
+      <div id="diagram-container" class="diagram-container">
+        <div class="legend-overlay">
+          <span class="legend-item"><span class="legend-swatch legend-swatch--dotted"></span>CTE source</span>
+          <span class="legend-item legend-item--icon"><svg class="legend-icon" viewBox="0 0 24 24"><use href="#icon-db"/></svg>Table</span>
+          <span class="legend-item legend-item--icon"><svg class="legend-icon" viewBox="0 0 24 24"><use href="#icon-cte"/></svg>CTE</span>
+          <span class="legend-hint">Hover a node to trace its flow · click a CTE to jump to the query · drag to pan · Ctrl/⌘+scroll to zoom</span>
+        </div>
+
+        <div id="error-state" class="error-state" hidden>
+          <div class="error-state__icon">⚠</div>
+          <p id="error-message" class="error-state__message"></p>
+        </div>
+
+        <p id="diagram-hint" class="diagram-hint">Paste a query on the left and click <strong>Format &amp; Visualize</strong>.</p>
+
+        <div id="diagram-canvas" class="diagram-canvas"></div>
+      </div>
+
+      <div id="relations-resizer" class="relations-resizer" role="separator" aria-orientation="horizontal"
+           aria-label="Resize entities list" tabindex="0" hidden></div>
+      <div id="relations-meta" class="relations-meta" hidden></div>
+    </section>
+
+  </main>
+
+  <!-- ══════════════════════════════════════════════════════════════════
+       SOURCE SWAP — a separate full-page view (not a modal/panel inside
+       the ERD), opened via the "Edit source →" prompt on a physical table
+       node. Hidden by default; source-swap.js toggles it the same safe
+       way script.js already toggles SQL Query / Formatted SQL (native
+       `hidden` attribute — see the lesson learned in script.js's MODULE 9
+       comments about why this must NOT use position:absolute+transform
+       tricks).
+       ══════════════════════════════════════════════════════════════════ -->
+  <main id="view-source-swap" class="source-swap-page" hidden>
+    <div class="source-swap-header">
+      <button id="source-swap-back" class="btn btn--ghost btn--sm">← Back to ERD</button>
+      <h1 class="source-swap-title">Edit source: <span id="source-swap-target-name">—</span></h1>
+    </div>
+
+    <form id="source-swap-form" class="source-swap-form">
+
+      <section class="source-swap-section">
+        <h2 class="source-swap-section__title">1. Sources</h2>
+        <p id="source-swap-cte-hint" class="source-swap-hint" hidden>
+          This is a CTE, not a single physical table — its own SQL body (shown further down
+          via the AI prompt) is treated as the old logic to replace, even if it currently
+          joins several raw sources together. Uploading an old-source sample below is
+          optional here; only the new source's sample is required. If only SOME columns need
+          to move to the new source (not the whole CTE), list them below — the new source
+          gets added via a LEFT JOIN alongside the existing logic instead of replacing it.
+        </p>
+        <div class="source-swap-row">
+          <label class="source-swap-field">
+            <span id="source-swap-old-name-label" class="source-swap-field__label">Table to replace</span>
+            <input id="source-swap-old-name" type="text" class="source-swap-input" readonly />
+          </label>
+          <span class="source-swap-arrow">→</span>
+          <label class="source-swap-field">
+            <span class="source-swap-field__label">New table to use</span>
+            <input id="source-swap-new-name" type="text" class="source-swap-input"
+                   placeholder="e.g. INTEGRATION.CORPORATE.DIM_MATERIAL" />
+          </label>
+        </div>
+        <div id="source-swap-columns-row" class="source-swap-row" hidden>
+          <label class="source-swap-field source-swap-field--wide">
+            <span class="source-swap-field__label">Columns to adjust <span class="source-swap-field__optional">(optional)</span></span>
+            <input id="source-swap-columns-to-adjust" type="text" class="source-swap-input"
+                   placeholder="e.g. rop, safety_stock — leave blank to fully replace this CTE's source" />
+          </label>
+        </div>
+      </section>
+
+      <section class="source-swap-section">
+        <h2 class="source-swap-section__title">2. Sample data</h2>
+        <p class="source-swap-hint">
+          Upload a CSV/TSV sample from each table (up to 10,000 rows). Only a small,
+          representative subset is ever sent to the AI — see the preview below.
+        </p>
+        <div class="source-swap-row source-swap-row--samples">
+          <div class="source-swap-upload" data-sample="old">
+            <span id="source-swap-old-sample-label" class="source-swap-field__label">Sample from OLD table</span>
+            <input id="source-swap-old-file" type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" class="source-swap-file-input" />
+            <div class="source-swap-dropzone" id="source-swap-old-dropzone">
+              <span>Click or drop a .csv/.tsv file</span>
+            </div>
+            <div id="source-swap-old-preview" class="source-swap-preview" hidden></div>
+          </div>
+          <div class="source-swap-upload" data-sample="new">
+            <span class="source-swap-field__label">Sample from NEW table</span>
+            <input id="source-swap-new-file" type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" class="source-swap-file-input" />
+            <div class="source-swap-dropzone" id="source-swap-new-dropzone">
+              <span>Click or drop a .csv/.tsv file</span>
+            </div>
+            <div id="source-swap-new-preview" class="source-swap-preview" hidden></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="source-swap-section">
+        <h2 class="source-swap-section__title">3. AI provider</h2>
+        <p id="source-swap-key-hint" class="source-swap-hint">
+          Your API key is used directly from this browser to call the provider's API —
+          SQL-Vis has no backend, so there is no proxy in between. The key stays in memory
+          for this page session only (never written to disk), but it will be visible in
+          this tab's Network panel like any client-only app that calls an API directly.
+        </p>
+        <p id="source-swap-shared-hint" class="source-swap-hint" hidden>
+          This uses a shared team key held server-side (Vercel) — your browser never sees
+          the real API key, only the password gates access to it. Only works once this app
+          is actually deployed (Vercel, or <code>vercel dev</code>) — a plain static server
+          like <code>npx serve</code> has no backend to call, see api/rewrite.js.
+        </p>
+        <div class="source-swap-row">
+          <label class="source-swap-field">
+            <span class="source-swap-field__label">Provider</span>
+            <select id="source-swap-provider" class="source-swap-input">
+              <option value="gemini">Google Gemini</option>
+              <option value="claude">Anthropic Claude</option>
+            </select>
+          </label>
+          <label class="source-swap-field">
+            <span class="source-swap-field__label">Model <span class="source-swap-field__optional">(optional)</span></span>
+            <input id="source-swap-model" type="text" class="source-swap-input" placeholder="uses provider default" />
+          </label>
+        </div>
+        <div class="source-swap-row">
+          <label class="source-swap-checkbox">
+            <input type="checkbox" id="source-swap-use-shared" />
+            <span>Use shared team access (password instead of a personal API key)</span>
+          </label>
+        </div>
+        <div class="source-swap-row">
+          <label class="source-swap-field source-swap-field--wide">
+            <span id="source-swap-api-key-label" class="source-swap-field__label">API key</span>
+            <input id="source-swap-api-key" type="password" class="source-swap-input" autocomplete="off" placeholder="Paste your API key" />
+          </label>
+        </div>
+        <button id="source-swap-generate" class="btn btn--primary" type="button" disabled>
+          Generate rewritten query
+        </button>
+        <div id="source-swap-generate-status" class="source-swap-status" hidden></div>
+      </section>
+
+      <section class="source-swap-section">
+        <h2 class="source-swap-section__title">4. Test tables (optional)</h2>
+        <p class="source-swap-hint">
+          If you validate by materializing full test tables in a scratch/playground schema —
+          rather than diffing the raw old/new source directly — name them here. SQL-Vis will
+          generate two ready-to-run "CREATE OR REPLACE TABLE" statements (the untouched original
+          query, and the AI-rewritten one) plus a comparison query that diffs those two tables'
+          own output instead of the raw source. Leave both blank to get the raw-source comparison
+          query instead.
+        </p>
+        <p id="source-swap-cte-test-table-required" class="source-swap-hint" hidden>
+          <strong>Required for this CTE target:</strong> a CTE can't be queried standalone the
+          way a physical table can, so the raw-source comparison isn't available here — name
+          both test tables below.
+        </p>
+        <div class="source-swap-row">
+          <label class="source-swap-field">
+            <span class="source-swap-field__label">Old test table name</span>
+            <input id="source-swap-old-test-table" type="text" class="source-swap-input"
+                   placeholder="e.g. playground.playground_asha.old_pr_po_indirect_monitoring" />
+          </label>
+          <label class="source-swap-field">
+            <span class="source-swap-field__label">New test table name</span>
+            <input id="source-swap-new-test-table" type="text" class="source-swap-input"
+                   placeholder="e.g. playground.playground_asha.new_pr_po_indirect_monitoring" />
+          </label>
+        </div>
+      </section>
+
+      <section id="source-swap-results" class="source-swap-section" hidden>
+        <h2 class="source-swap-section__title">5. Results</h2>
+
+        <div class="source-swap-result-block">
+          <div class="source-swap-result-block__header">
+            <span>Rewritten query</span>
+            <button type="button" class="btn btn--ghost btn--sm" data-copy-target="source-swap-rewritten-query">Copy</button>
+          </div>
+          <pre id="source-swap-rewritten-query" class="source-swap-result-code"></pre>
+        </div>
+
+        <div id="source-swap-playground-results" hidden>
+          <div class="source-swap-result-block">
+            <div class="source-swap-result-block__header">
+              <span>Old test table — materialize the untouched original query</span>
+              <button type="button" class="btn btn--ghost btn--sm" data-copy-target="source-swap-old-test-table-sql">Copy</button>
+            </div>
+            <pre id="source-swap-old-test-table-sql" class="source-swap-result-code"></pre>
+          </div>
+
+          <div class="source-swap-result-block">
+            <div class="source-swap-result-block__header">
+              <span>New test table — materialize the rewritten query</span>
+              <button type="button" class="btn btn--ghost btn--sm" data-copy-target="source-swap-new-test-table-sql">Copy</button>
+            </div>
+            <pre id="source-swap-new-test-table-sql" class="source-swap-result-code"></pre>
+          </div>
+        </div>
+
+        <div id="source-swap-ai-notes" class="source-swap-ai-notes"></div>
+
+        <div class="source-swap-result-block">
+          <div class="source-swap-result-block__header">
+            <span id="source-swap-comparison-query-label">Validation query — row count &amp; SUM comparison, run this in Snowflake</span>
+            <button type="button" class="btn btn--ghost btn--sm" data-copy-target="source-swap-comparison-query">Copy</button>
+          </div>
+          <pre id="source-swap-comparison-query" class="source-swap-result-code"></pre>
+        </div>
+      </section>
+
+    </form>
+  </main>
+
+  <!-- Shared icon defs used by <use> inside the generated ERD nodes/legend -->
+  <svg width="0" height="0" style="position:absolute">
+    <defs>
+      <symbol id="icon-db" viewBox="0 0 24 24">
+        <ellipse cx="12" cy="5" rx="8" ry="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <path d="M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      </symbol>
+      <symbol id="icon-cte" viewBox="0 0 24 24">
+        <rect x="4" y="4" width="16" height="4.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <rect x="4" y="9.75" width="16" height="4.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <rect x="4" y="15.5" width="16" height="4.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      </symbol>
+      <!-- Blueprint grid, drawn INSIDE the diagram's own zoomable SVG (see
+           script.js's renderInteractiveDiagram, the "bg" pan-target rect) —
+           patternUnits="userSpaceOnUse" ties the 24x24 tile to whatever
+           coordinate system it's painted into, so it scales with the
+           viewBox the same way every node/edge does, instead of staying a
+           fixed-size CSS background that ignores zoom (.diagram-container's
+           own background-image is the pre-visualize idle-state fallback).
+           The tile needs its OWN solid backing rect — a pattern with only
+           the grid-line path is transparent everywhere else, which let the
+           fixed-size CSS grid underneath show through the gaps as a second,
+           differently-scaled grid once this one was zoomed. -->
+      <pattern id="erd-grid-pattern" width="24" height="24" patternUnits="userSpaceOnUse">
+        <rect width="24" height="24" style="fill: var(--bg-base)"/>
+        <path d="M 24 0 L 0 0 0 24" fill="none" stroke="rgba(45, 212, 191, 0.055)" stroke-width="1"/>
+      </pattern>
+    </defs>
+  </svg>
+
+  <!-- Optional, gitignored, local-only: pre-fills the AI provider form with
+       your own API key so you don't have to re-paste it every reload. Safe
+       to be missing — a 404 here just means the form starts blank, same as
+       before. See config.local.example.js for what this is (and isn't). -->
+  <script src="config.local.js" onerror="this.remove()"></script>
+
+  <script src="script.js"></script>
+  <script src="ai-providers.js"></script>
+  <script src="comparison-query-generator.js"></script>
+  <script src="source-swap.js"></script>
+</body>
+</html>
